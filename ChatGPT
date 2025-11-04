@@ -1,0 +1,240 @@
+
+"""
+Henter bilde fra Robotiq Wrist Camera (lagret via UR-program),
+lager linjetegning, mapper til A4, genererer URScript og sender til UR3.
+
+Avh.: opencv-python, numpy, paramiko
+pip install opencv-python numpy paramiko
+"""
+
+import cv2 as cv
+import numpy as np
+import socket
+import math
+import paramiko
+from pathlib import Path
+
+# =========================
+# 🔧 KONFIGURASJON
+# =========================
+
+# --- Nettverk/roboter ---
+UR_IP = "192.168.0.10"        # IP til UR-kontrolleren
+UR_PORT = 30002               # URScript-port (secondary client)
+
+# --- Robotiq/lagret bildefil ---
+# Kjør en Robotiq "Save Image" (eller tilsvarende) i UR-programmet og pek til riktig fil her:
+REMOTE_IMG = "/urmedia/usb0/Robotiq/Images/last.png"  # eksempelsti; endre til din
+LOCAL_IMG  = "last.png"
+
+# --- SFTP på UR-kontrolleren (standard på en del oppsett) ---
+SFTP_USER = "root"
+SFTP_PASS = "easybot"
+SFTP_PORT = 22
+
+# --- A4 og marger ---
+A4_W, A4_H = 210.0, 297.0     # mm (liggende/stående håndteres av skalering)
+MARGIN = 8.0                  # mm (fribord rundt motivet)
+DRAW_W, DRAW_H = A4_W-2*MARGIN, A4_H-2*MARGIN
+
+# --- Tegneparametre ---
+Z_AIR_MM  = 30.0              # “løftehøyde” over arket i mm
+Z_DRAW_MM = 0.0               # kontakt med ark (0 mm over planets Z)
+SPEED_AIR = 0.20              # m/s (luftbevegelse)
+SPEED_DRAW = 0.03             # m/s (tegning)
+ACC       = 0.5               # m/s^2
+PEN_DO    = 0                 # Tool Digital Output-nummer for pennløfter (0 eller 1)
+TOOL_VOLT = 24                # Tool voltage (0/12/24) for evt. solenoid/servo
+
+# --- Plan/feature-oppstilling ---
+# Vi trenger posen til arkeplanet i base (eller et annet kjent frame).
+# Anbefaling: Flytt TCP til A4-origo (f.eks. nedre venstre hjørne) og les av get_actual_tcp_pose() i PolyScope.
+# Lim inn verdiene under som meter/radianer:
+PAGE_POSE_M = (0.400, 0.100, 0.050, math.pi, 0.0, 0.0)
+#                x      y      z      rx       ry   rz   (EKSEMPEL! MÅ erstattes av dine verdier)
+
+# --- Bildeprosessering ---
+CANNY_LOW, CANNY_HIGH = 80, 160
+EPSILON_PIX = 2.0             # Douglas–Peucker forenkling (px)
+MAX_PTS_PER_POLY = 200        # begrensning pr polyline (jevn sampling)
+MIN_CONTOUR_LEN = 12          # kutt vekk små fliser
+
+
+# =========================
+# HJELPEFUNKSJONER
+# =========================
+
+def sftp_fetch(host, remote_path, local_path, user, passwd, port=22, timeout=5):
+    """Hent fil via SFTP fra UR-kontrolleren."""
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(host, username=user, password=passwd, port=port, timeout=timeout)
+    sftp = client.open_sftp()
+    Path(local_path).parent.mkdir(parents=True, exist_ok=True)
+    sftp.get(remote_path, local_path)
+    sftp.close()
+    client.close()
+    return local_path
+
+def image_to_polylines(img_bgr, epsilon=EPSILON_PIX, max_pts=MAX_PTS_PER_POLY):
+    """Kant->konturer->forenklede polylines (liste av Nx2 arrays i piksel-koordinater)."""
+    gray = cv.cvtColor(img_bgr, cv.COLOR_BGR2GRAY)
+    gray = cv.GaussianBlur(gray, (5,5), 0)
+    edges = cv.Canny(gray, CANNY_LOW, CANNY_HIGH)
+    edges = cv.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
+    edges = cv.erode(edges,  np.ones((3,3), np.uint8), iterations=1)
+
+    cnts, _ = cv.findContours(edges, cv.RETR_LIST, cv.CHAIN_APPROX_NONE)
+    polylines = []
+    for c in cnts:
+        if len(c) < MIN_CONTOUR_LEN:
+            continue
+        approx = cv.approxPolyDP(c, epsilon, False)
+        pts = approx[:,0,:].astype(np.float32)  # Nx2
+
+        # jevn undersampling hvis veldig lang
+        if len(pts) > max_pts:
+            idx = np.linspace(0, len(pts)-1, max_pts).astype(int)
+            pts = pts[idx]
+        polylines.append(pts)
+    return polylines
+
+def scale_to_a4(polylines_px, src_w, src_h, margin=MARGIN):
+    """Skaler fra piksler til A4-mm (bevar aspekt, sentrer, snu Y så +Y blir oppover på arket)."""
+    sx = DRAW_W / src_w
+    sy = DRAW_H / src_h
+    s  = min(sx, sy)
+    tx = margin + (DRAW_W  - s*src_w)/2.0
+    ty = margin + (DRAW_H  - s*src_h)/2.0
+
+    out = []
+    for poly in polylines_px:
+        xy = poly.copy()
+        xy[:,0] = s*xy[:,0] + tx
+        xy[:,1] = s*(src_h - xy[:,1]) + ty  # snu y-akse: bilde-topp -> +Y
+        out.append(xy)
+    return out
+
+def order_polylines(polys):
+    """En enkel nearest-neighbor rekkefølging for å redusere luftbevegelser."""
+    if not polys:
+        return polys
+    used = [False]*len(polys)
+    ordered = []
+    cur = 0
+    used[cur] = True
+    ordered.append(polys[cur])
+
+    def end_point(poly):
+        return poly[-1]
+
+    while len(ordered) < len(polys):
+        last = end_point(ordered[-1])
+        best_i, best_d, best_rev = None, 1e18, False
+        for i, p in enumerate(polys):
+            if used[i]: continue
+            d1 = np.linalg.norm(last - p[0])
+            d2 = np.linalg.norm(last - p[-1])
+            if d1 < best_d:
+                best_d, best_i, best_rev = d1, i, False
+            if d2 < best_d:
+                best_d, best_i, best_rev = d2, i, True
+        used[best_i] = True
+        chosen = polys[best_i][::-1] if best_rev else polys[best_i]
+        ordered.append(chosen)
+    return ordered
+
+def ur_pose_from_mm(x_mm, y_mm, z_mm, rx, ry, rz):
+    """Pose-string i meter/rad for URScript."""
+    return f"p[{x_mm/1000.0:.6f},{y_mm/1000.0:.6f},{z_mm/1000.0:.6f},{rx:.6f},{ry:.6f},{rz:.6f}]"
+
+def pose_tuple_to_str(pose):
+    x,y,z,rx,ry,rz = pose
+    return f"p[{x:.6f},{y:.6f},{z:.6f},{rx:.6f},{ry:.6f},{rz:.6f}]"
+
+def polylines_to_urscript(polylines_mm, page_pose_m=PAGE_POSE_M):
+    """
+    Generer ett URScript: penn opp/ned på tool-DO, movel langs polylines,
+    med posetransform via pose_trans(PAGE_POSE, offsetPose).
+    """
+    lines = []
+    lines.append("def draw_from_python():")
+    lines.append(f"  set_tool_voltage({TOOL_VOLT})")
+    lines.append(f"  set_tool_digital_out({PEN_DO}, False)")  # penn opp
+    lines.append("  sleep(0.05)")
+    lines.append(f"  PAGE = {pose_tuple_to_str(page_pose_m)}")
+
+    # faste orientering for "penn ned" (antatt TCP peker ned)
+    rx, ry, rz = page_pose_m[3], page_pose_m[4], page_pose_m[5]
+
+    for poly in polylines_mm:
+        if len(poly) < 2:
+            continue
+        x0, y0 = poly[0]
+        # Luft til startpunkt (over arket)
+        pose_air_start = ur_pose_from_mm(x0, y0, Z_AIR_MM + Z_DRAW_MM, rx, ry, rz)
+        lines.append(f"  movel(pose_trans(PAGE, {pose_air_start}), a={ACC}, v={SPEED_AIR})")
+
+        # Penn ned
+        lines.append(f"  set_tool_digital_out({PEN_DO}, True)")
+        lines.append("  sleep(0.05)")
+
+        # Tegn langs polyline i Z = Z_DRAW_MM
+        for i in range(len(poly)):
+            x, y = poly[i]
+            pose_draw = ur_pose_from_mm(x, y, Z_DRAW_MM, rx, ry, rz)
+            lines.append(f"  movel(pose_trans(PAGE, {pose_draw}), a={ACC}, v={SPEED_DRAW})")
+
+        # Penn opp og løft
+        lines.append(f"  set_tool_digital_out({PEN_DO}, False)")
+        lines.append("  sleep(0.02)")
+        lines.append(f"  movel(pose_trans(PAGE, {pose_air_start}), a={ACC}, v={SPEED_AIR})")
+
+    lines.append("end")
+    return "\n".join(lines)
+
+def send_urscript(script_text, host=UR_IP, port=UR_PORT, timeout=5):
+    """Send script til UR-kontroller (secondary client)."""
+    # UR krever at første linje starter med 'def' i kolonne 1, og siste er 'end' i kolonne 1.
+    assert script_text.lstrip().startswith("def")
+    assert script_text.rstrip().endswith("end")
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    s.connect((host, port))
+    s.sendall(script_text.encode("utf-8"))
+    s.close()
+
+# =========================
+# HOVEDFLYT
+# =========================
+
+def main():
+    # 1) Hent bildefil via SFTP
+    print("[1/4] Henter bilde via SFTP fra UR ...")
+    sftp_fetch(UR_IP, REMOTE_IMG, LOCAL_IMG, SFTP_USER, SFTP_PASS, port=SFTP_PORT)
+    img = cv.imread(LOCAL_IMG)
+    if img is None:
+        raise RuntimeError(f"Kunne ikke lese {LOCAL_IMG}")
+    H, W = img.shape[:2]
+    print(f"   OK: {LOCAL_IMG} ({W}x{H})")
+
+    # 2) Bildet -> polylines
+    print("[2/4] Ekstraherer polylines ...")
+    polys_px = image_to_polylines(img)
+    print(f"   fant {len(polys_px)} polylines før sortering")
+
+    # 3) Skaler til A4 (mm) og sorter
+    print("[3/4] Skalerer til A4 og optimaliserer rekkefølge ...")
+    polys_mm = scale_to_a4(polys_px, W, H, margin=MARGIN)
+    polys_mm = [p for p in polys_mm if len(p) >= 2]
+    polys_mm = order_polylines(polys_mm)
+    print(f"   klare polylines: {len(polys_mm)}")
+
+    # 4) Generer og send URScript
+    print("[4/4] Genererer og sender URScript ...")
+    script = polylines_to_urscript(polys_mm, PAGE_POSE_M)
+    send_urscript(script)
+    print("   Ferdig! Robot tegner.")
+
+if __name__ == "__main__":
+    main()
