@@ -1,99 +1,160 @@
 import numpy as np
 import cv2 as cv
+import os
+ 
 
-
-
-#grayscaling and blurring the image to reduce noise
-def gray_and_blur(path, kernel_size):
-    '''
-    Uploads image from path, blurs it and grayscales it for further processing
-
-    args:
-        path: file path of chosen image
-        kernel_size: (x,y) Size of kernel when blurring. Bigger = more blurry
-
-    returns:
-        image: blurred and grayscaled image as variable for further use
-   '''
+class ImageProcessor:
     
-    image = cv.imread(path, cv.IMREAD_GRAYSCALE)
-    image = cv.blur(image, kernel_size)
+    
+    # Intializing object variables:
+    def __init__(self, image_path):
+        self.image_path = image_path # File name
+        self.image = None
+        self.edges = None
+        self.polylines = []
+        self.stripped_polylines = np.empty((0,2), np.float32)
+        self.px_width, self.px_height = 0, 0
+        self.px_center = []
+        self.mm = None
+        self.liste =[]
+        self.mm_polylines = []
+    
+    
+    
+    # Retrieving image from file name
+    def find_image(self):
+        
+        # Check if file path exist, if not: find file:
+        if not os.path.exists(self.image_path):
+            sample_path = cv.samples.findFile(self.image_path)
+            if not sample_path:
+                raise FileNotFoundError(f"Image not found: {self.image_path}")
+            self.image_path = sample_path
+        
+        # Load image, rotate if horizontal
+        self.image = cv.imread(self.image_path, cv.IMREAD_GRAYSCALE)
+        if self.image is None:
+            raise ValueError(f"cv.imread failed for: {self.image_path}")
+        # Rotate image if width > height
+        if self.image.shape[0] > self.image.shape[1]:
+            self.image = cv.rotate(self.image, cv.ROTATE_90_CLOCKWISE)
+            
+        return self.image
+        
+    
+    
+    # Grayscaling and blurring the image to detect edges:
+    def detect_edges(self, low_threshold=100, high_threshold=150, blur=(3,3)):
+        
+        if self.image is not None and self.image.shape[0] > 0:
+            self.image = cv.GaussianBlur(self.image, blur, 0)
+            
+            # Detecting edges in image by thresholding:
+            self.edges = cv.Canny(self.image, low_threshold, high_threshold)
+            
+            # Smoothing the edges by filling smaller gaps, merging lines that are close by:
+            kernel = np.ones((4,4),np.uint8)
+            self.edges = cv.morphologyEx(self.edges, cv.MORPH_CLOSE, kernel, iterations=1)
+            self.edges = cv.dilate(self.edges, kernel, iterations=1)
+            self.edges = cv.erode(self.edges, kernel, iterations=1)
+            
+        return self.edges
+
+
+
+    # Converting edges to polygons:
+    def get_polylines(self, min_length=12, max_length=80, epsilon=4.0, samples=50):
+        
+        # Finding contours in image:
+        if self.edges.all():
+            print("No edges found.")
+        contours, _ = cv.findContours(self.edges, cv.RETR_LIST, cv.CHAIN_APPROX_SIMPLE) 
+        
+        for i in contours:
+            
+            # Ignoring small lines:
+            if len(i) < min_length:
+                continue
+            
+            # Approximating the polygons:
+            approximation = cv.approxPolyDP(i, epsilon, False)
+            pts = approximation[:,0,:].astype(np.float32)  # Nx2
+            
+            # Simplifying lines by removing and spacing points:
+            if len(pts) > max_length:
+                spaced_pts = np.linspace(0, len(pts)-1, samples).astype(int)
+                pts = pts[spaced_pts]
+            self.polylines.append(pts)
+            
+        # Removing [] from array:
+        if len(self.polylines) > 0:
+            self.stripped_polylines = np.concatenate(self.polylines, axis=0)  # (N, 2)
+            print("Antall punkter:", len(self.stripped_polylines))
+            #print("Eksempel på første 5 punkter:\n", self.stripped_polylines[:5])
+        else:
+            self.stripped_polylines = np.empty((0, 2))
+            
+        return self.polylines, self.stripped_polylines
+    
+    
+    
+    # Scaling drawing from pixel to mm:
+    def scale_drawing(self, A4_width=210.0, A4_height=297.0, margin=8.0):       
+        
+        # Image dimensions:
+        self.px_width, self.px_height = self.image.shape[:2] # x = bredde, y = høyde
+        self.px_center = np.array([self.px_width / 2, self.px_height / 2], dtype=np.float32)
+        
+        # Defining workspace in A4 sheet:
+        workspace_width, workspace_heigth = A4_width-2*margin, A4_height-2*margin
+        A4_center = np.array([A4_width / 2, A4_height / 2], dtype=np.float32)
+        
+        # Scaling pixels in mm:
+        sx = A4_width / self.px_width
+        sy = A4_height / self.px_height
+        s  = min(sx, sy)
+        tx = margin + (A4_width  - s * self.px_width) / 2.0
+        ty = margin + (A4_height  - s * self.px_height) / 2.0
+        
+        # Scaling drawing to A4:
+        for poly in self.polylines:
+            if poly is None or len(poly) == 0:
+                continue
+            if poly.ndim == 3 and poly.shape[1:] == (1,2):
+                poly = poly[:,0,:]
+            if poly.shape[1] != 2:
+                continue
+            self.mm = np.empty_like(poly, dtype=np.float32)
+            self.mm[:,0] = s*poly[:,0] + tx
+            self.mm[:,1] = s*(self.px_height - poly[:,1]) + ty
+            self.mm_polylines.append(self.mm)
+            self.liste.append(len(poly))
+            
+        print("Antall linjer:", len(self.liste))
+        print(self.liste)    
+        
+        return self.liste, self.mm
+        
+      
+        
+    def show_image(self):
+        # Show image / object of the drawing
+        #cv.imshow(self.image_path, self.image) 
+        
+        # Show drawing / strokes:
+        blank = 255 * np.ones_like(self.image)
+        for pts in self.polylines:
+            cv.polylines(blank, [pts.astype(np.int32)], isClosed=False, color=0, thickness=1)
+        cv.imshow("Drawing by Pierre Robot", blank)
+        
+        # Close pop-up images at key-press:
+        cv.waitKey(0)
+        cv.destroyAllWindows()
 
     
-    return image
-
-#getting shape of image for later interpolation to x,y coordinates:
-def dimensions(image):
-    height, width = image.shape[:2] 
-    center = ([width/2, height/2])
-
-    return height, width, center
-
-
-
-#threshhold for large shapes, edges for potential details
-def vectorize_image(image):
-    '''
-    Vectorizes edges in the image by using threshold and canny to find contours on vector form.
-
-    args:
-        image: chosen image
-
-    returns:
-        contours_edge: Contrours found from Canny
-        contours_thresh: Contours found from threshold
-        image_contours: all contours superimposed on the original image.
-   '''
-    _, thresh = cv.threshold(image, 200, 255, cv.THRESH_BINARY_INV)
-    edges = cv.Canny(image, 55, 70)
-
-    contours_thresh, _ = cv.findContours(thresh, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    contours_edge, _ = cv.findContours(edges, cv.RETR_EXTERNAL, cv.CHAIN_APPROX_SIMPLE)
-    
-    image_contours = cv.drawContours(image, contours_thresh, -1, (0,255,0), 1)
-    image_contours = cv.drawContours(image_contours, contours_edge, -1, (0,255,0), 1)
-
-    return contours_edge, contours_thresh, image_contours
-
-#print("Contours found = ", len(contours_edge)+len(contours_thresh))
-
-
-#approximating contours for simpler POSE commands:
-def simplifying_vectors(image, contours, factor):
-    '''
-    Simplifies the vectors to fewer line segments
-
-    args:
-        image: chosen image
-        contours: set of contours to be simplified
-        factor: number. How detailed the simplification should be. High = less detailed
-
-    returns:
-        approx: set of new vectors
-        image_approx: new vectors superimposed on image
-   
-   '''
-    for i in contours:
-        epsilon = factor*cv.arcLength(i, True)
-        approx = cv.approxPolyDP(i, epsilon, True)
-
-        image_approx = cv.drawContours(image, approx, -1, (0, 255, 0), 1)
-
-        return approx, image_approx
-
-
-#showing the image in pop-up for tuning.
-def image_for_tuning(image):
-    '''
-    creates a pop up of image with vectors so user can check if its ok.
-
-    args:
-        image: chosen image
-   
-   '''
-    cv.imshow("test", image)
-
-    cv.waitKey(0)
-    cv.destroyAllWindows()
-
-
+draw = ImageProcessor("Lenna_test.png")
+draw.find_image()
+draw.detect_edges()
+draw.get_polylines()
+draw.scale_drawing()
+draw.show_image()
