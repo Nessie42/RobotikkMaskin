@@ -12,7 +12,7 @@ from image_processing import ImageProcessor
 
 
 def main():
-    artist = PierreRobot(image_path="Lenna_test.png")
+    artist = PierreRobot(image_path='robot_image.jpeg')
     artist.greet_user()
     artist.take_photo()
     artist.setup_workspace()
@@ -24,7 +24,7 @@ def main():
 
 class PierreRobot:
     
-    def __init__(self, image_path="Lenna_test.png"):
+    def __init__(self, image_path='robot_image.jpeg'):
         self.image_path = image_path
         self.paper_pose = None
         self.marker_pose = None
@@ -59,7 +59,7 @@ class PierreRobot:
             if go_ahead != "y":
                 print("Excusez-moi, reposistion the camera so I can see you better s'il vous plaît.")
             else:
-                #retrieve_image.save_image(read_from_robot.HOST)
+                retrieve_image.save_image(read_from_robot.SKOLEIP)
                 send_to_robot.sendCommand('sec secondaryProg():\nset_digital_out(0, False)\nend')
                 print("Fantastique! I shall use your lovely image as a - how you say - reference.")
                 break

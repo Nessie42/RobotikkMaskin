@@ -110,7 +110,7 @@ def wait_for_move_end():
         Y_actual = Y_actual*0.001
         Z_actual = Z_actual*0.001
         
-        if np.abs(X_target-X_actual) < 0.0005 and np.abs(Y_target-Y_actual) < 0.0005 and np.abs(Z_target-Z_actual) < 0.0005:
+        if np.abs(X_target-X_actual) < 0.00005 and np.abs(Y_target-Y_actual) < 0.00005 and np.abs(Z_target-Z_actual) < 0.00005:
             print(f'loop has broken' )
             break
     s.close()

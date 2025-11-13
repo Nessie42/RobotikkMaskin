@@ -49,7 +49,7 @@ class ImageProcessor:
     
     
     # Grayscaling and blurring the image to detect edges:
-    def detect_edges(self, low_threshold=100, high_threshold=150, blur=(3,3)):
+    def detect_edges(self, low_threshold=25, high_threshold=50, blur=(3,3)):
         
         if self.image is not None and self.image.shape[0] > 0:
             self.image = cv.GaussianBlur(self.image, blur, 0)
@@ -104,7 +104,9 @@ class ImageProcessor:
             raise RuntimeError("No image loaded before scale_drawing().")
         if not self.polylines:
             print("No polylines to scale.")
-            return [], []
+            self.stripped_scaled_polylines = np.empty((0, 2), np.float32)
+            self.pts_per_polyline = []
+            return [], self.stripped_scaled_polylines, self.pts_per_polyline
     
         # Image dimensions:
         self.image_height, self.image_width = self.image.shape[:2] # x = antall pixler i hver høyde(rad), y = antal pixler i hver bredde(kolonne)
@@ -136,7 +138,7 @@ class ImageProcessor:
             return [], self.stripped_scaled_polylines, self.pts_per_polyline
         
  #chatgpt herfra og ned til comments
-       
+        '''      
         # 1) Finn bounding box for selve tegningen (alle polylines)
         all_points = np.vstack([
             pts.reshape(-1, 2) if pts.ndim == 3 else pts
@@ -203,35 +205,38 @@ class ImageProcessor:
         
         
         
+        '''
+        for poly in self.polylines:
+            if poly is None or len(poly) == 0:
+                continue
+            if poly.ndim == 3 and poly.shape[1:] == (1,2):
+                poly = poly[:,0,:]
+            if poly.shape[1] != 2:
+                continue
+            self.A4_coordinates = np.empty_like(poly, dtype=np.float32)
+            self.A4_coordinates[:,0] = scale_factor * poly[:,0] + 2*offset_width
+            self.A4_coordinates[:,1] = scale_factor * (self.image_height - poly[:,1]) + offset_height # Flips the Y-axis
+            
+            self.scaled_polylines.append(self.A4_coordinates)
+            
+            #self.A4_coordinates[:,1] = scale_factor * (self.image_height - poly[:,1]) + offset_height # Flips the Y-axis
+            
+            self.pts_per_polyline.append(len(poly))
+            
+        print("Antall linjer:", len(self.pts_per_polyline))
+        print(self.pts_per_polyline)    
+        print("Antall polylines:", len(self.scaled_polylines))
+        #print(self.scaled_polylines)   
+            
+        # Removing [] from array:
+        if len(self.scaled_polylines) > 0:
+            self.stripped_scaled_polylines = np.concatenate(self.scaled_polylines, axis=0)  # (N, 2)
+            print("Antall punkter:", len(self.stripped_scaled_polylines))
+            #print("Eksempel på første 5 punkter:\n", self.stripped_polylines[:5])
+        else:
+            self.stripped_scaled_polylines = np.empty((0, 2))
         
-        # for poly in self.polylines:
-        #     if poly is None or len(poly) == 0:
-        #         continue
-        #     if poly.ndim == 3 and poly.shape[1:] == (1,2):
-        #         poly = poly[:,0,:]
-        #     if poly.shape[1] != 2:
-        #         continue
-        #     self.A4_coordinates = np.empty_like(poly, dtype=np.float32)
-        #     self.A4_coordinates[:,0] = scale_factor * poly[:,0] + offset_width
-        #     self.A4_coordinates[:,1] = scale_factor * (self.image_height - poly[:,1]) + offset_height # Flips the Y-axis
-        #     self.scaled_polylines.append(self.A4_coordinates)
-            
-        #     self.pts_per_polyline.append(len(poly))
-            
-        # print("Antall linjer:", len(self.pts_per_polyline))
-        # print(self.pts_per_polyline)    
-        # print("Antall polylines:", len(self.scaled_polylines))
-        # #print(self.scaled_polylines)   
-            
-        # # Removing [] from array:
-        # if len(self.scaled_polylines) > 0:
-        #     self.stripped_scaled_polylines = np.concatenate(self.scaled_polylines, axis=0)  # (N, 2)
-        #     print("Antall punkter:", len(self.stripped_scaled_polylines))
-        #     #print("Eksempel på første 5 punkter:\n", self.stripped_polylines[:5])
-        # else:
-        #     self.stripped_scaled_polylines = np.empty((0, 2))
-        
-        # return self.scaled_polylines, self.stripped_scaled_polylines, self.pts_per_polyline
+        return self.scaled_polylines, self.stripped_scaled_polylines, self.pts_per_polyline
         
  
     
@@ -280,7 +285,7 @@ class ImageProcessor:
 
     
 if __name__ == "__main__":
-    draw = ImageProcessor("Lenna_test.png")
+    draw = ImageProcessor('robot_image.jpeg')
     draw.find_image()
     draw.detect_edges()
     draw.get_polylines()
